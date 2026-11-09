@@ -43,6 +43,20 @@ cmd_deploy() {
         "${SCRIPT_DIR}"
 
     echo "==> Starting container on port ${PORT}..."
+    # Browser-origin contract (docs/APP_CLI_PATTERN.md): the runner's browser
+    # reaches the app at the bridge gateway, not localhost. Default Gitea's
+    # absolute-URL settings from TESTER_ENV_BROWSER_ORIGIN, falling back to
+    # localhost:$PORT for manual runs. Never override an explicit operator
+    # value (GITEA__server__ROOT_URL). In launcher/tunnel mode the launcher
+    # patch prepends TESTER_ENV_PUBLIC_ORIGIN to this chain.
+    EFFECTIVE_ORIGIN="${GITEA__server__ROOT_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+    EFFECTIVE_ORIGIN="${EFFECTIVE_ORIGIN%/}"
+    ORIGIN_HOST="${EFFECTIVE_ORIGIN#https://}"
+    ORIGIN_HOST="${ORIGIN_HOST#http://}"
+    ORIGIN_HOST="${ORIGIN_HOST%%/*}"
+    ORIGIN_HOST="${ORIGIN_HOST%%:*}"
+    if [[ -z "${ORIGIN_HOST}" ]]; then ORIGIN_HOST="localhost"; fi
+
     docker volume create \
         --label "tester-env.project=${TESTER_ENV_PROJECT}" \
         --label "tester-env.app=${TESTER_ENV_APP}" \
@@ -58,125 +72,189 @@ cmd_deploy() {
         -v "${DATA_VOLUME}:/data" \
         -e "GITEA__security__SECRET_KEY=tester-env-secret-key-2026" \
         -e "GITEA__security__INTERNAL_TOKEN=tester-env-internal-token-2026" \
+        -e "GITEA__security__MIN_PASSWORD_LENGTH=6" \
         -e "GITEA__server__DISABLE_SSH=true" \
         -e "GITEA__security__INSTALL_LOCK=true" \
-        -e "GITEA__server__DOMAIN=localhost" \
+        -e "GITEA__server__DOMAIN=${ORIGIN_HOST}" \
         -e "GITEA__server__SSH_DOMAIN=localhost" \
-        -e "GITEA__server__ROOT_URL=http://localhost:3000" \
+        -e "GITEA__server__ROOT_URL=${EFFECTIVE_ORIGIN}" \
         "${IMAGE_NAME}"
 
     echo "==> Waiting for app to start..."
+    healthy=0
     for i in $(seq 1 30); do
         if curl -sf "http://localhost:${PORT}/api/v1/version" >/dev/null 2>&1; then
             echo "==> Gitea healthy at http://localhost:${PORT}"
+            healthy=1
             break
         fi
         sleep 2
     done
+    if [[ "${healthy}" != "1" ]]; then
+        echo "ERROR: Gitea did not become healthy at http://localhost:${PORT}" >&2
+        exit 1
+    fi
 
+    # The admin CLI races app config initialization right after the first
+    # healthy probe ("Unable to load config file for a installed Gitea
+    # instance"), so retry briefly. An existing admin is success (deploy is
+    # re-runnable against a kept volume).
     echo "==> Creating admin user..."
-    docker exec "${CONTAINER_NAME}" su-exec git gitea admin user create \
-        --admin --username admin --password admin \
-        --email admin@example.com --must-change-password=false
+    created=0
+    create_out=""
+    for i in $(seq 1 15); do
+        if create_out=$(docker exec "${CONTAINER_NAME}" su-exec git gitea admin user create \
+            --admin --username admin --password admin \
+            --email admin@example.com --must-change-password=false 2>&1); then
+            created=1
+            break
+        fi
+        if echo "${create_out}" | grep -qi "already exist"; then
+            echo "==> Admin user already exists."
+            created=1
+            break
+        fi
+        echo "==> Admin creation not ready yet (attempt ${i}/15), retrying in 2s..."
+        sleep 2
+    done
+    if [[ "${created}" != "1" ]]; then
+        echo "ERROR: failed to create admin user:" >&2
+        echo "${create_out}" >&2
+        exit 1
+    fi
 
     echo "==> Deployment complete. App running at http://localhost:${PORT}"
 }
 
+# POST JSON to the Gitea API; HTTP 200/201/422 all count as success so seed
+# is re-runnable (422 = already exists). Anything else prints the status and
+# body and fails. BASE and AUTH are globals set by cmd_seed.
+api_post() {
+    local url="$1" data="$2" body code
+    body=$(mktemp)
+    code=$(curl -s -o "${body}" -w "%{http_code}" -u "${AUTH}" -X POST "${url}" \
+        -H "Content-Type: application/json" -d "${data}" || true)
+    if [[ "${code}" == "200" || "${code}" == "201" || "${code}" == "422" ]]; then
+        cat "${body}"
+        rm -f "${body}"
+        return 0
+    fi
+    echo "ERROR: POST ${url} -> HTTP ${code}" >&2
+    cat "${body}" >&2
+    rm -f "${body}"
+    return 1
+}
+
 cmd_seed() {
-    local BASE="http://localhost:${PORT}/api/v1"
-    local AUTH="admin:admin"
+    BASE="http://localhost:${PORT}/api/v1"
+    AUTH="admin:admin"
 
     echo "==> Seeding Atlas Labs data..."
 
-    # Check if already seeded
-    if curl -sf -u "${AUTH}" "${BASE}/orgs/atlas-labs" >/dev/null 2>&1; then
-        echo "==> Seed data already exists (org atlas-labs found). Skipping."
-        echo "==> Seeding complete."
-        return 0
-    fi
-
-    # --- Users ---
+    # --- Users (skip users that already exist) ---
     echo "==> Creating users..."
     for user_json in \
         '{"username":"alice","email":"alice@atlaslabs.dev","password":"alice123","full_name":"Alice Chen","must_change_password":false,"send_notify":false}' \
         '{"username":"bob","email":"bob@atlaslabs.dev","password":"bob123","full_name":"Bob Martinez","must_change_password":false,"send_notify":false}' \
         '{"username":"charlie","email":"charlie@atlaslabs.dev","password":"charlie123","full_name":"Charlie Kim","must_change_password":false,"send_notify":false}'; do
-        curl -sf -u "${AUTH}" -X POST "${BASE}/admin/users" \
-            -H "Content-Type: application/json" \
-            -d "${user_json}" >/dev/null
+        username=$(echo "${user_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+        if curl -sf -u "${AUTH}" "${BASE}/users/${username}" >/dev/null 2>&1; then
+            echo "  user ${username} already exists, skipping."
+            continue
+        fi
+        api_post "${BASE}/admin/users" "${user_json}" >/dev/null
     done
-    echo "==> Created 3 users: alice, bob, charlie"
+    echo "==> Users ready: alice, bob, charlie"
 
-    # --- Org ---
+    # --- Org (422-tolerant: re-run safe) ---
     echo "==> Creating org atlas-labs..."
-    curl -sf -u "${AUTH}" -X POST "${BASE}/orgs" \
-        -H "Content-Type: application/json" \
-        -d '{"username":"atlas-labs","full_name":"Atlas Labs","description":"Atlas Labs Engineering","visibility":"public"}' >/dev/null
+    api_post "${BASE}/orgs" \
+        '{"username":"atlas-labs","full_name":"Atlas Labs","description":"Atlas Labs Engineering","visibility":"public"}' >/dev/null
 
-    # --- Team ---
+    # --- Team (skip if already present) ---
     echo "==> Creating team engineering..."
-    curl -sf -u "${AUTH}" -X POST "${BASE}/orgs/atlas-labs/teams" \
-        -H "Content-Type: application/json" \
-        -d '{"name":"engineering","description":"Engineering team","permission":"write","units":["repo.code","repo.issues","repo.pulls","repo.releases","repo.wiki"]}' >/dev/null
+    EXISTING_TEAMS=$(curl -sf -u "${AUTH}" "${BASE}/orgs/atlas-labs/teams" || echo "[]")
+    if echo "${EXISTING_TEAMS}" | python3 -c "import sys,json; sys.exit(0 if 'engineering' in [t.get('name') for t in json.load(sys.stdin)] else 1)"; then
+        echo "  team engineering already exists, skipping."
+    else
+        api_post "${BASE}/orgs/atlas-labs/teams" \
+            '{"name":"engineering","description":"Engineering team","permission":"write","units":["repo.code","repo.issues","repo.pulls","repo.releases","repo.wiki"]}' >/dev/null
+    fi
 
-    # --- Repos ---
+    # --- Repos (skip repos that already exist) ---
     echo "==> Creating repos..."
     for repo_json in \
         '{"name":"checkout-service","description":"Customer checkout and payment processing service","auto_init":true,"default_branch":"main","private":false}' \
         '{"name":"data-pipeline","description":"ETL pipelines for analytics and reporting","auto_init":true,"default_branch":"main","private":false}' \
         '{"name":"frontend-app","description":"Customer-facing web application","auto_init":true,"default_branch":"main","private":false}'; do
-        curl -sf -u "${AUTH}" -X POST "${BASE}/orgs/atlas-labs/repos" \
-            -H "Content-Type: application/json" \
-            -d "${repo_json}" >/dev/null
+        repo_name=$(echo "${repo_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+        if curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/${repo_name}" >/dev/null 2>&1; then
+            echo "  repo atlas-labs/${repo_name} already exists, skipping."
+            continue
+        fi
+        api_post "${BASE}/orgs/atlas-labs/repos" "${repo_json}" >/dev/null
     done
-    echo "==> Created 3 repos: checkout-service, data-pipeline, frontend-app"
+    echo "==> Repos ready: checkout-service, data-pipeline, frontend-app"
 
-    # --- Labels for checkout-service ---
+    # --- Labels for checkout-service (create only missing ones) ---
     echo "==> Creating labels for checkout-service..."
+    EXISTING_LABELS=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/labels" || echo "[]")
     for label_json in \
         '{"name":"bug","color":"d73a4a","description":"Something is broken"}' \
         '{"name":"enhancement","color":"a2eeef","description":"New feature or request"}' \
         '{"name":"documentation","color":"0075ca","description":"Documentation changes"}' \
         '{"name":"priority-high","color":"b60205","description":"High priority"}' \
         '{"name":"priority-low","color":"0e8a16","description":"Low priority"}'; do
-        curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/labels" \
-            -H "Content-Type: application/json" \
-            -d "${label_json}" >/dev/null
+        label_name=$(echo "${label_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+        if echo "${EXISTING_LABELS}" | python3 -c "import sys,json; sys.exit(0 if '${label_name}' in [l.get('name') for l in json.load(sys.stdin)] else 1)"; then
+            echo "  label ${label_name} already exists, skipping."
+            continue
+        fi
+        api_post "${BASE}/repos/atlas-labs/checkout-service/labels" "${label_json}" >/dev/null
     done
-    echo "==> Created 5 labels"
+    echo "==> Labels ready"
 
-    # --- Milestones for checkout-service ---
+    # --- Milestones for checkout-service (reuse the milestone if present) ---
     echo "==> Creating milestones for checkout-service..."
-    MILESTONE_RESP=$(curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/milestones" \
-        -H "Content-Type: application/json" \
-        -d '{"title":"v1.4.0 Gateway Stabilization","description":"Stabilize payment gateway integration and fix timeout issues","due_on":"2026-08-01T00:00:00Z"}')
-    MILESTONE_ID=$(echo "${MILESTONE_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-    echo "==> Created milestone: v1.4.0 Gateway Stabilization (id=${MILESTONE_ID})"
+    EXISTING_MILESTONES=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/milestones?state=all" || echo "[]")
+    MILESTONE_ID=$(echo "${EXISTING_MILESTONES}" | python3 -c "
+import sys,json
+ms=[m for m in json.load(sys.stdin) if m.get('title')=='v1.4.0 Gateway Stabilization']
+print(ms[0]['id'] if ms else '')")
+    if [[ -z "${MILESTONE_ID}" ]]; then
+        MILESTONE_RESP=$(api_post "${BASE}/repos/atlas-labs/checkout-service/milestones" \
+            '{"title":"v1.4.0 Gateway Stabilization","description":"Stabilize payment gateway integration and fix timeout issues","due_on":"2026-08-01T00:00:00Z"}')
+        MILESTONE_ID=$(echo "${MILESTONE_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+    else
+        echo "  milestone v1.4.0 Gateway Stabilization already exists (id=${MILESTONE_ID}), reusing."
+    fi
+    echo "==> Milestone ready: v1.4.0 Gateway Stabilization (id=${MILESTONE_ID})"
 
-    # --- Issues for checkout-service ---
+    # --- Issues for checkout-service (skip as a group if any already exist) ---
     echo "==> Creating issues for checkout-service..."
+    EXISTING_ISSUES=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/issues?state=all&limit=50" || echo "[]")
+    EXISTING_ISSUE_COUNT=$(echo "${EXISTING_ISSUES}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+    if [[ "${EXISTING_ISSUE_COUNT}" != "0" ]]; then
+        echo "  ${EXISTING_ISSUE_COUNT} issues already present, skipping issue creation."
+    else
     # Issue 1: Open, enhancement, milestone
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        -H "Content-Type: application/json" \
-        -d "{\"title\":\"Implement payment gateway integration\",\"body\":\"Integrate Stripe and PayPal payment gateways for the checkout flow.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
+    api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
+        "{\"title\":\"Implement payment gateway integration\",\"body\":\"Integrate Stripe and PayPal payment gateways for the checkout flow.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
     sleep 0.5
 
     # Issue 2: Open, enhancement, milestone
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        -H "Content-Type: application/json" \
-        -d "{\"title\":\"Add refund audit log notes\",\"body\":\"Add audit trail notes to refund transactions for compliance.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"bob\"}" >/dev/null
+    api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
+        "{\"title\":\"Add refund audit log notes\",\"body\":\"Add audit trail notes to refund transactions for compliance.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"bob\"}" >/dev/null
     sleep 0.5
 
     # Issue 3: Open, bug, priority-high, milestone
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        -H "Content-Type: application/json" \
-        -d "{\"title\":\"Fix checkout timeout on large carts\",\"body\":\"Checkout times out when cart has more than 50 items due to synchronous tax calculation.\",\"labels\":[\"bug\",\"priority-high\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
+    api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
+        "{\"title\":\"Fix checkout timeout on large carts\",\"body\":\"Checkout times out when cart has more than 50 items due to synchronous tax calculation.\",\"labels\":[\"bug\",\"priority-high\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
     sleep 0.5
 
     # Issue 4: Closed, documentation
-    ISSUE4_RESP=$(curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        -H "Content-Type: application/json" \
-        -d '{"title":"Set up CI/CD pipeline","body":"Configure GitHub Actions for build, test, and deploy workflow.","labels":["documentation"],"assignee":"charlie"}')
+    ISSUE4_RESP=$(api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
+        '{"title":"Set up CI/CD pipeline","body":"Configure GitHub Actions for build, test, and deploy workflow.","labels":["documentation"],"assignee":"charlie"}')
     ISSUE4_INDEX=$(echo "${ISSUE4_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['number'])")
 
     # Close issue #4
@@ -185,40 +263,56 @@ cmd_seed() {
         -d '{"state":"closed"}' >/dev/null
 
     echo "==> Created 4 issues (3 open, 1 closed)"
+    fi
 
-    # --- Branch ---
+    # --- Branch (skip if already present) ---
     echo "==> Creating feature branch..."
-    # Get main branch SHA
-    MAIN_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/git/refs/heads/main")
-    MAIN_SHA=$(echo "${MAIN_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'])")
+    if curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/branches/feature%2Frefund-audit-log" >/dev/null 2>&1; then
+        echo "  branch feature/refund-audit-log already exists, skipping."
+    else
+        # Get main branch SHA
+        MAIN_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/git/refs/heads/main")
+        MAIN_SHA=$(echo "${MAIN_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'])")
 
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/git/refs" \
-        -H "Content-Type: application/json" \
-        -d "{\"ref\":\"refs/heads/feature/refund-audit-log\",\"sha\":\"${MAIN_SHA}\"}" >/dev/null
-    echo "==> Created branch: feature/refund-audit-log"
+        api_post "${BASE}/repos/atlas-labs/checkout-service/git/refs" \
+            "{\"ref\":\"refs/heads/feature/refund-audit-log\",\"sha\":\"${MAIN_SHA}\"}" >/dev/null
+        echo "==> Created branch: feature/refund-audit-log"
+    fi
 
-    # --- PR ---
+    # --- PR (skip if any PR already exists) ---
     echo "==> Creating pull request..."
-    PR_RESP=$(curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/pulls" \
-        -H "Content-Type: application/json" \
-        -d '{"title":"Add refund audit log notes","body":"Closes #2 - Adds audit trail notes to refund transactions.","head":"feature/refund-audit-log","base":"main"}')
-    echo "==> Created PR: Add refund audit log notes"
+    EXISTING_PRS=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/pulls?state=all" || echo "[]")
+    EXISTING_PR_COUNT=$(echo "${EXISTING_PRS}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+    if [[ "${EXISTING_PR_COUNT}" != "0" ]]; then
+        echo "  ${EXISTING_PR_COUNT} pull request(s) already present, skipping."
+    else
+        api_post "${BASE}/repos/atlas-labs/checkout-service/pulls" \
+            '{"title":"Add refund audit log notes","body":"Closes #2 - Adds audit trail notes to refund transactions.","head":"feature/refund-audit-log","base":"main"}' >/dev/null
+        echo "==> Created PR: Add refund audit log notes"
+    fi
 
-    # --- Release ---
+    # --- Release (skip if the tag already exists) ---
     echo "==> Creating release..."
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/releases" \
-        -H "Content-Type: application/json" \
-        -d '{"tag_name":"v1.4.0","target_commitish":"main","name":"v1.4.0 Gateway Stabilization","body":"## Changes\n- Payment gateway integration\n- Refund audit log notes\n- Fix checkout timeout on large carts\n- CI/CD pipeline","draft":false,"prerelease":false}' >/dev/null
-    echo "==> Created release: v1.4.0 Gateway Stabilization"
+    if curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/releases/tags/v1.4.0" >/dev/null 2>&1; then
+        echo "  release v1.4.0 already exists, skipping."
+    else
+        api_post "${BASE}/repos/atlas-labs/checkout-service/releases" \
+            '{"tag_name":"v1.4.0","target_commitish":"main","name":"v1.4.0 Gateway Stabilization","body":"## Changes\n- Payment gateway integration\n- Refund audit log notes\n- Fix checkout timeout on large carts\n- CI/CD pipeline","draft":false,"prerelease":false}' >/dev/null
+        echo "==> Created release: v1.4.0 Gateway Stabilization"
+    fi
 
-    # --- Wiki page ---
+    # --- Wiki page (skip if already present) ---
     echo "==> Creating wiki page..."
-    WIKI_CONTENT_B64=$(echo -n "# Incident Response\n\n## Overview\n\nThis document describes the incident response procedures for the checkout-service.\n\n## Triage\n\n1. Identify the incident severity.\n2. Notify the on-call engineer via PagerDuty.\n3. Create a status page incident.\n\n## Escalation\n\n| Severity | Response Time | Escalation |\n|----------|--------------|------------|\n| Sev1 | 15 minutes | Engineering Manager |\n| Sev2 | 30 minutes | Team Lead |\n| Sev3 | 2 hours | Sprint Owner |\n\n## Post-Mortem\n\nAll Sev1 and Sev2 incidents require a post-mortem within 5 business days." | base64 -w0)
+    EXISTING_WIKI=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/wiki/pages" || echo "[]")
+    if echo "${EXISTING_WIKI}" | python3 -c "import sys,json; sys.exit(0 if 'Incident Response' in [p.get('title') for p in json.load(sys.stdin)] else 1)"; then
+        echo "  wiki page Incident Response already exists, skipping."
+    else
+        WIKI_CONTENT_B64=$(echo -n "# Incident Response\n\n## Overview\n\nThis document describes the incident response procedures for the checkout-service.\n\n## Triage\n\n1. Identify the incident severity.\n2. Notify the on-call engineer via PagerDuty.\n3. Create a status page incident.\n\n## Escalation\n\n| Severity | Response Time | Escalation |\n|----------|--------------|------------|\n| Sev1 | 15 minutes | Engineering Manager |\n| Sev2 | 30 minutes | Team Lead |\n| Sev3 | 2 hours | Sprint Owner |\n\n## Post-Mortem\n\nAll Sev1 and Sev2 incidents require a post-mortem within 5 business days." | base64 -w0)
 
-    curl -sf -u "${AUTH}" -X POST "${BASE}/repos/atlas-labs/checkout-service/wiki/new" \
-        -H "Content-Type: application/json" \
-        -d "{\"title\":\"Incident Response\",\"content_base64\":\"${WIKI_CONTENT_B64}\"}" >/dev/null
-    echo "==> Created wiki page: Incident Response"
+        api_post "${BASE}/repos/atlas-labs/checkout-service/wiki/new" \
+            "{\"title\":\"Incident Response\",\"content_base64\":\"${WIKI_CONTENT_B64}\"}" >/dev/null
+        echo "==> Created wiki page: Incident Response"
+    fi
 
     echo "==> Seeding complete."
 }
@@ -367,7 +461,7 @@ Commands:
 Options:
   --ref <git-ref>   Git ref (branch, tag, or commit) to checkout before deploy.
                     Useful for deploying specific scenario baselines or mutants.
-  --run-id <id>     Isolate container, image, and volume names for parallel runs.
+  --run-id <id>     Isolate container and volume names for parallel runs.
                     Default: default
   --port <port>     Host port to bind to container port 3000.
                     Default: 3000

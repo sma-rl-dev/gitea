@@ -22,7 +22,7 @@
 | `status` | Show container status |
 
 Options:
-- `--run-id <id>` isolates container, image, and volume names for parallel scenario runs.
+- `--run-id <id>` isolates container and volume names for parallel scenario runs (the image tag is content-addressed and shared).
 - `--port <port>` binds the app to a specific host port. Default: 3000.
 - `--ref <git-ref>` checks out a ref before deployment for manual runs.
 
@@ -46,7 +46,10 @@ Uses the root `Dockerfile` (multi-stage Go + PNPM). Builds with `make frontend` 
 - Port: `3000`
 - URL: `http://localhost:3000`
 - Requires pinned `SECRET_KEY` and `INTERNAL_TOKEN` for deterministic behavior.
+- `GITEA__security__MIN_PASSWORD_LENGTH=6`: the shortest documented seed password is `bob` / `bob123` (6 chars) and Gitea's default minimum is 8, which rejects API user creation with 400. No scenario logs in as a seed user (all use `admin` / `admin`), so lowering the minimum keeps the documented credentials valid without touching them.
 - `DISABLE_SSH=true` and `INSTALL_LOCK=true` skip setup wizards.
+- `ROOT_URL`/`DOMAIN` default from `TESTER_ENV_BROWSER_ORIGIN` (browser-origin contract) so redirects and absolute links stay on the runner browser's origin, falling back to `http://localhost:$PORT` for manual runs. An explicit `GITEA__server__ROOT_URL` always wins.
+- `seed` is idempotent: every resource creation first checks for (or tolerates) the existing record, so re-running `seed` is safe.
 
 ## Credentials
 
