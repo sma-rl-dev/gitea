@@ -232,29 +232,38 @@ print(ms[0]['id'] if ms else '')")
 
     # --- Issues for checkout-service (skip as a group if any already exist) ---
     echo "==> Creating issues for checkout-service..."
-    EXISTING_ISSUES=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/issues?state=all&limit=50" || echo "[]")
+    EXISTING_ISSUES=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/issues?state=all&type=issues&limit=50" || echo "[]")
     EXISTING_ISSUE_COUNT=$(echo "${EXISTING_ISSUES}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
     if [[ "${EXISTING_ISSUE_COUNT}" != "0" ]]; then
         echo "  ${EXISTING_ISSUE_COUNT} issues already present, skipping issue creation."
     else
+    # This Gitea version requires label IDs (not names) in CreateIssueOption.
+    LABELS_JSON=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/labels")
+    label_id() {
+        echo "${LABELS_JSON}" | python3 -c "import sys,json; print(next(l['id'] for l in json.load(sys.stdin) if l.get('name')==sys.argv[1]))" "$1"
+    }
+    ENHANCEMENT_ID=$(label_id enhancement)
+    BUG_ID=$(label_id bug)
+    DOCUMENTATION_ID=$(label_id documentation)
+    PRIORITY_HIGH_ID=$(label_id priority-high)
     # Issue 1: Open, enhancement, milestone
     api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        "{\"title\":\"Implement payment gateway integration\",\"body\":\"Integrate Stripe and PayPal payment gateways for the checkout flow.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
+        "{\"title\":\"Implement payment gateway integration\",\"body\":\"Integrate Stripe and PayPal payment gateways for the checkout flow.\",\"labels\":[${ENHANCEMENT_ID}],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
     sleep 0.5
 
     # Issue 2: Open, enhancement, milestone
     api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        "{\"title\":\"Add refund audit log notes\",\"body\":\"Add audit trail notes to refund transactions for compliance.\",\"labels\":[\"enhancement\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"bob\"}" >/dev/null
+        "{\"title\":\"Add refund audit log notes\",\"body\":\"Add audit trail notes to refund transactions for compliance.\",\"labels\":[${ENHANCEMENT_ID}],\"milestone\":${MILESTONE_ID},\"assignee\":\"bob\"}" >/dev/null
     sleep 0.5
 
     # Issue 3: Open, bug, priority-high, milestone
     api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        "{\"title\":\"Fix checkout timeout on large carts\",\"body\":\"Checkout times out when cart has more than 50 items due to synchronous tax calculation.\",\"labels\":[\"bug\",\"priority-high\"],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
+        "{\"title\":\"Fix checkout timeout on large carts\",\"body\":\"Checkout times out when cart has more than 50 items due to synchronous tax calculation.\",\"labels\":[${BUG_ID},${PRIORITY_HIGH_ID}],\"milestone\":${MILESTONE_ID},\"assignee\":\"alice\"}" >/dev/null
     sleep 0.5
 
     # Issue 4: Closed, documentation
     ISSUE4_RESP=$(api_post "${BASE}/repos/atlas-labs/checkout-service/issues" \
-        '{"title":"Set up CI/CD pipeline","body":"Configure GitHub Actions for build, test, and deploy workflow.","labels":["documentation"],"assignee":"charlie"}')
+        "{\"title\":\"Set up CI/CD pipeline\",\"body\":\"Configure GitHub Actions for build, test, and deploy workflow.\",\"labels\":[${DOCUMENTATION_ID}],\"assignee\":\"charlie\"}")
     ISSUE4_INDEX=$(echo "${ISSUE4_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['number'])")
 
     # Close issue #4
@@ -270,12 +279,10 @@ print(ms[0]['id'] if ms else '')")
     if curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/branches/feature%2Frefund-audit-log" >/dev/null 2>&1; then
         echo "  branch feature/refund-audit-log already exists, skipping."
     else
-        # Get main branch SHA
-        MAIN_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/git/refs/heads/main")
-        MAIN_SHA=$(echo "${MAIN_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'])")
-
-        api_post "${BASE}/repos/atlas-labs/checkout-service/git/refs" \
-            "{\"ref\":\"refs/heads/feature/refund-audit-log\",\"sha\":\"${MAIN_SHA}\"}" >/dev/null
+        # Gitea has no git/refs creation endpoint (405); create the branch
+        # from main via the native branches endpoint instead.
+        api_post "${BASE}/repos/atlas-labs/checkout-service/branches" \
+            '{"new_branch_name":"feature/refund-audit-log","old_ref_name":"main"}' >/dev/null
         echo "==> Created branch: feature/refund-audit-log"
     fi
 
@@ -335,7 +342,7 @@ cmd_verify() {
 
     # Check repos
     echo "==> Checking repos..."
-    REPOS_RESP=$(curl -sf -u "${AUTH}" "${BASE}/orgs/atlas-labs/repos")
+    REPOS_RESP=$(curl -sf -u "${AUTH}" "${BASE}/orgs/atlas-labs/repos" || echo "[]")
     REPO_COUNT=$(echo "${REPOS_RESP}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
     if [[ "${REPO_COUNT}" != "3" ]]; then
         echo "ERROR: expected 3 repos, got ${REPO_COUNT}"
@@ -346,7 +353,7 @@ cmd_verify() {
 
     # Check checkout-service issues
     echo "==> Checking checkout-service issues..."
-    ISSUES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/issues?state=all&limit=20")
+    ISSUES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/issues?state=all&type=issues&limit=20" || echo "[]")
     ISSUE_COUNT=$(echo "${ISSUES_RESP}" | python3 -c "import sys,json; items=json.load(sys.stdin); print(len(items))")
     OPEN_COUNT=$(echo "${ISSUES_RESP}" | python3 -c "import sys,json; items=json.load(sys.stdin); print(sum(1 for i in items if i['state']=='open'))")
     if [[ "${ISSUE_COUNT}" != "4" ]]; then
@@ -364,7 +371,7 @@ cmd_verify() {
 
     # Check branches
     echo "==> Checking branches..."
-    BRANCHES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/branches")
+    BRANCHES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/branches" || echo "[]")
     BRANCH_COUNT=$(echo "${BRANCHES_RESP}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
     if [[ "${BRANCH_COUNT}" != "2" ]]; then
         echo "ERROR: expected 2 branches, got ${BRANCH_COUNT}"
@@ -375,7 +382,7 @@ cmd_verify() {
 
     # Check PRs
     echo "==> Checking pull requests..."
-    PR_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/pulls?state=all")
+    PR_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/pulls?state=all" || echo "[]")
     PR_COUNT=$(echo "${PR_RESP}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
     if [[ "${PR_COUNT}" != "1" ]]; then
         echo "ERROR: expected 1 PR, got ${PR_COUNT}"
@@ -386,7 +393,7 @@ cmd_verify() {
 
     # Check releases
     echo "==> Checking releases..."
-    RELEASES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/releases")
+    RELEASES_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/releases" || echo "[]")
     RELEASE_COUNT=$(echo "${RELEASES_RESP}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
     if [[ "${RELEASE_COUNT}" != "1" ]]; then
         echo "ERROR: expected 1 release, got ${RELEASE_COUNT}"
@@ -397,7 +404,7 @@ cmd_verify() {
 
     # Check wiki pages
     echo "==> Checking wiki pages..."
-    WIKI_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/wiki/pages")
+    WIKI_RESP=$(curl -sf -u "${AUTH}" "${BASE}/repos/atlas-labs/checkout-service/wiki/pages" || echo "[]")
     WIKI_COUNT=$(echo "${WIKI_RESP}" | python3 -c "import sys,json; items=json.load(sys.stdin); print(len(items) if isinstance(items, list) else 0)")
     if [[ "${WIKI_COUNT}" != "1" ]]; then
         echo "ERROR: expected 1 wiki page, got ${WIKI_COUNT}"
